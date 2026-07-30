@@ -50,7 +50,7 @@
                         <div class="text-xs text-slate-500 mt-0.5">v${version}</div>
                     </div>
                     <div class="flex gap-2">
-                        ${plugin.hasGit ? `<button class="pm-update text-xs px-2 py-1 rounded bg-blue-600 hover:bg-blue-500" data-name="${plugin.name}">Update</button>` : ''}
+                        ${plugin.canUpdate ? `<button class="pm-update text-xs px-2 py-1 rounded bg-blue-600 hover:bg-blue-500" data-name="${plugin.name}">Update</button>` : ''}
                         <button class="pm-remove text-xs px-2 py-1 rounded bg-red-600/50 hover:bg-red-500" data-name="${plugin.name}">Remove</button>
                     </div>
                 `;

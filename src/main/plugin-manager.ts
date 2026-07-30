@@ -5,7 +5,9 @@ import { ipcMain } from 'electron';
 import { execFile } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 import { getPluginsDir, restartPython } from './python';
+import { parseGitHubRepository, PLUGIN_SOURCE_FILE } from './plugin-source';
 
 // Run git with an explicit argv array — never via a shell. This removes the
 // OS command-injection vector that `exec(`git clone ${gitUrl} ...`)` had:
@@ -13,7 +15,11 @@ import { getPluginsDir, restartPython } from './python';
 function execFileAsync(file: string, args: string[], cwd?: string): Promise<string> {
     return new Promise((resolve, reject) => {
         execFile(file, args, { cwd, timeout: 60000 }, (error, stdout, stderr) => {
-            if (error) reject(new Error(stderr || error.message));
+            if (error) {
+                const failure = new Error(stderr.trim() || error.message) as NodeJS.ErrnoException;
+                failure.code = (error as NodeJS.ErrnoException).code;
+                reject(failure);
+            }
             else resolve(stdout.trim());
         });
     });
@@ -55,8 +61,36 @@ interface InstalledPlugin {
     name: string;
     path: string;
     hasGit: boolean;
+    canUpdate: boolean;
     manifest: any | null;
     version: string;
+}
+
+function readArchiveSource(pluginDir: string): string | null {
+    try {
+        const value = JSON.parse(fs.readFileSync(path.join(pluginDir, PLUGIN_SOURCE_FILE), 'utf8'))?.url;
+        return typeof value === 'string' && parseGitHubRepository(value) ? value : null;
+    } catch {
+        return null;
+    }
+}
+
+async function installGitHubArchive(gitUrl: string, targetDir: string): Promise<void> {
+    const repository = parseGitHubRepository(gitUrl);
+    if (!repository) throw new Error('archive fallback only supports public github.com repositories');
+
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'feedback-plugin-'));
+    const archivePath = path.join(tempDir, 'plugin.tar.gz');
+    try {
+        const response = await fetch(`https://codeload.github.com/${repository.owner}/${repository.repo}/tar.gz/HEAD`);
+        if (!response.ok) throw new Error(`GitHub download returned HTTP ${response.status}`);
+        fs.writeFileSync(archivePath, Buffer.from(await response.arrayBuffer()));
+        fs.mkdirSync(targetDir, { recursive: true });
+        await execFileAsync('tar', ['-xzf', archivePath, '--strip-components=1', '-C', targetDir]);
+        fs.writeFileSync(path.join(targetDir, PLUGIN_SOURCE_FILE), JSON.stringify({ url: gitUrl }) + '\n');
+    } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
 }
 
 async function listInstalledPlugins(): Promise<InstalledPlugin[]> {
@@ -83,6 +117,7 @@ async function listInstalledPlugins(): Promise<InstalledPlugin[]> {
         if (!isDir) continue;
         const manifestPath = path.join(pluginPath, 'plugin.json');
         const gitDir = path.join(pluginPath, '.git');
+        const archiveSource = readArchiveSource(pluginPath);
 
         let manifest = null;
         try {
@@ -105,6 +140,7 @@ async function listInstalledPlugins(): Promise<InstalledPlugin[]> {
             name: entry.name,
             path: pluginPath,
             hasGit: fs.existsSync(gitDir),
+            canUpdate: fs.existsSync(gitDir) || archiveSource !== null,
             manifest,
             version,
         });
@@ -149,6 +185,15 @@ async function installPlugin(gitUrl: string, name?: string): Promise<{ success: 
     } catch (e: any) {
         // Clean up failed clone
         try { fs.rmSync(targetDir, { recursive: true }); } catch { /* ignore */ }
+        if (e?.code === 'ENOENT' && parseGitHubRepository(gitUrl)) {
+            try {
+                await installGitHubArchive(gitUrl, targetDir);
+                return { success: true, message: `Installed "${name}" successfully. Restart to activate.` };
+            } catch (archiveError: any) {
+                try { fs.rmSync(targetDir, { recursive: true }); } catch { /* ignore */ }
+                return { success: false, message: `Git is unavailable and the GitHub download failed: ${archiveError.message}` };
+            }
+        }
         return { success: false, message: `Failed to clone: ${e.message}` };
     }
 }
@@ -183,14 +228,34 @@ async function updatePlugin(name: string): Promise<{ success: boolean; message: 
         return { success: false, message: `Plugin "${name}" not found` };
     }
 
-    if (!fs.existsSync(path.join(targetDir, '.git'))) {
+    if (!fs.existsSync(path.join(targetDir, '.git')) && !readArchiveSource(targetDir)) {
         return { success: false, message: `Plugin "${name}" is not a git repository — cannot update` };
     }
 
     try {
-        const output = await execFileAsync('git', ['pull'], targetDir);
-        if (output.includes('Already up to date')) {
-            return { success: true, message: `"${name}" is already up to date` };
+        if (fs.existsSync(path.join(targetDir, '.git'))) {
+            const output = await execFileAsync('git', ['pull'], targetDir);
+            if (output.includes('Already up to date')) {
+                return { success: true, message: `"${name}" is already up to date` };
+            }
+        } else {
+            const sourceUrl = readArchiveSource(targetDir)!;
+            const suffix = `${process.pid}-${Date.now()}`;
+            const stagedDir = `${targetDir}.update-${suffix}`;
+            const backupDir = `${targetDir}.backup-${suffix}`;
+            try {
+                await installGitHubArchive(sourceUrl, stagedDir);
+                fs.renameSync(targetDir, backupDir);
+                try {
+                    fs.renameSync(stagedDir, targetDir);
+                } catch (error) {
+                    fs.renameSync(backupDir, targetDir);
+                    throw error;
+                }
+                fs.rmSync(backupDir, { recursive: true, force: true });
+            } finally {
+                fs.rmSync(stagedDir, { recursive: true, force: true });
+            }
         }
         return { success: true, message: `Updated "${name}". Restart to activate changes.` };
     } catch (e: any) {
